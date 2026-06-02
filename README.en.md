@@ -244,7 +244,7 @@ storage analysis
 
 ## 🌟 About
 
-I'm Khazix (数字生命卡兹克). Founder of Virxact. Background in visual communication design, with stints in user research and interaction design — **I'm not a programmer**. My day job is translating AI into things normal people can actually understand and use.
+I'm Khazix (数字生命卡兹克), founder of Virxact. I try to share fun, practical AI know-how — and may we always stay curious about the world.
 
 These skills are what I personally use every day. If they help you, a ⭐ is appreciated. Questions or suggestions welcome in Issues / Discussions.
 
