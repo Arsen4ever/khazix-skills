@@ -58,7 +58,7 @@ Replace `<skill-name>` with the one you want — e.g. `neat-freak`, `hv-analysis
 
 > *"Cleaning Mac junk has been a CleanMyMac job for a decade. Now a single skill replaces it."*
 
-Tell your agent something like "check my storage" or "C: drive is full". It scans your whole disk and opens an **interactive HTML report** in your browser: disk overview, top 5 space hogs, prioritized cleanup, and a 🟢🟡🔴 three-tier list. Every command is one-click-copy; you can also click buttons to move to Trash / delete (always with a second confirmation dialog).
+Tell your agent something like "check my storage" or "C: drive is full". It scans your whole disk and opens an **interactive HTML report** in your browser: disk overview, top 5 space hogs, prioritized cleanup, and a 🟢🟡🔴 three-tier list. Every command is one-click-copy; cleanup defaults to the reversible Move to Trash action. Permanent deletion is disabled by default.
 
 **Why it beats CleanMyMac**
 
@@ -68,13 +68,13 @@ This skill is agent-driven. Every entry comes with **specific path + content cla
 
 **Three-tier classification is the core**
 
-- 🟢 **Green** — Pure caches, temp files. Regenerate automatically. Safe for one-click cleanup
+- 🟢 **Green** — Pure caches and temp files. Default one-click action moves them to Trash
 - 🟡 **Yellow** — Contains user data (offline videos, downloads, project code). Only "Open in Finder" and (where safe) "Move to Trash". You decide
 - 🔴 **Red** — Running app core data, system files. Explains why not to touch, gives at most "Open folder". Never a delete button
 
 **Hard rules**
 
-Scan phase is **read-only**, period. Deletions require **two clicks** — button on the page, then a browser confirm dialog. The local server runs on 127.0.0.1 + random port + token, with three whitelists (green = can rm; yellow = trash only; both = open).
+Scan phase is **read-only**, period. Cleanup requires browser confirmation. The local server runs on 127.0.0.1 + a random port and token, and checks path allowlists, protected directories, Host, and Origin. Permanent deletion requires an explicit startup flag and typing `DELETE` for each request.
 
 **🌐 Cross-platform**: macOS fully tested; Windows code-ready (multi-drive supported), worth eyeballing on first run
 
@@ -122,11 +122,8 @@ Lets any SKILL.md-supporting agent pull AI HOT's daily report and all AI news fr
 
 **🌐 Cross-platform**: Claude Code · Codex CLI · Cursor · Gemini CLI · OpenCode · Cline · Windsurf
 
-**🇨🇳 China-friendly direct install** (no GitHub access needed):
-
-```
-curl -fsSL https://aihot.virxact.com/aihot-skill/install.sh | bash
-```
+This hardened branch does not use remote pipe-to-shell installers. Install
+`aihot` from this repository checkout.
 
 → [SKILL.md](./aihot/SKILL.md) · [aihot.virxact.com](https://aihot.virxact.com) · [Integration guide](https://aihot.virxact.com/agent)
 

@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-横纵分析法报告 Markdown → PDF 转换脚本 (WeasyPrint版)
+横纵分析法报告 Markdown → PDF 转换脚本
 用法: python md_to_pdf.py input.md output.pdf [--title "报告标题"] [--author "作者"]
 
-依赖: pip install weasyprint markdown --break-system-packages
+依赖: 在隔离虚拟环境中安装 markdown。优先使用 WeasyPrint；不可用时回退到
+Chrome / Edge 的无头打印能力。
 """
 
 import sys
 import os
 import re
 import argparse
+import html
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+from pathlib import Path
 import markdown
 
 # ── CSS 样式 ──
@@ -202,8 +210,13 @@ a {
 
 
 def md_to_html(md_text, title="横纵分析报告", subtitle="横纵分析法深度研究报告",
-               meta_line="", author="数字生命卡兹克"):
+               meta_line="", author="研究报告"):
     """将 Markdown 转为带封面的 HTML"""
+
+    # Do not allow raw HTML or image resources from report content. This keeps
+    # PDF rendering from executing markup or reading local/network resources.
+    md_text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"[\1]", md_text)
+    md_text = html.escape(md_text)
 
     # 用 markdown 库转换正文
     html_body = markdown.markdown(
@@ -215,22 +228,27 @@ def md_to_html(md_text, title="横纵分析报告", subtitle="横纵分析法深
     # 移除正文中的第一个 h1（会用在封面上）
     first_h1_match = re.search(r'<h1>(.*?)</h1>', html_body)
     if first_h1_match:
-        extracted_title = first_h1_match.group(1)
+        extracted_title = html.unescape(first_h1_match.group(1))
         if not title or title == "横纵分析报告":
             title = extracted_title
         html_body = html_body.replace(first_h1_match.group(0), '', 1)
 
     # 替换 CSS 中的页眉占位符
-    css = CSS_TEMPLATE.replace("HEADER_TEXT", f"{title}  |  横纵分析法深度研究报告")
+    safe_title = html.escape(title)
+    safe_subtitle = html.escape(subtitle)
+    safe_meta = html.escape(meta_line)
+    safe_author = html.escape(author)
+    css_title = title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    css = CSS_TEMPLATE.replace("HEADER_TEXT", f"{css_title}  |  横纵分析法深度研究报告")
 
     # 构建封面
     cover_html = f"""
     <div class="cover">
-        <h1 style="page-break-before: avoid; border: none;">{title}</h1>
-        <div class="subtitle">{subtitle}</div>
-        {"<div class='meta'>" + meta_line + "</div>" if meta_line else ""}
+        <h1 style="page-break-before: avoid; border: none;">{safe_title}</h1>
+        <div class="subtitle">{safe_subtitle}</div>
+        {"<div class='meta'>" + safe_meta + "</div>" if meta_line else ""}
         <hr class="divider">
-        <div class="meta">作者: {author}</div>
+        <div class="meta">作者: {safe_author}</div>
     </div>
     """
 
@@ -249,12 +267,110 @@ def md_to_html(md_text, title="横纵分析报告", subtitle="横纵分析法深
     return full_html
 
 
+def chrome_candidates():
+    candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("msedge"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        root = os.environ.get(env_name)
+        if root:
+            candidates.extend([
+                os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+            ])
+    return [candidate for candidate in candidates if candidate and os.path.isfile(candidate)]
+
+
+def render_with_chromium(html_path, output_path):
+    candidates = chrome_candidates()
+    if not candidates:
+        raise RuntimeError("未找到可用的 Chrome、Chromium 或 Edge")
+    profile = tempfile.mkdtemp(prefix="hv-analysis-chrome-")
+    try:
+        cmd = [
+            candidates[0],
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--no-first-run",
+            "--no-pdf-header-footer",
+            "--print-to-pdf-no-header",
+            f"--user-data-dir={profile}",
+            f"--print-to-pdf={os.path.abspath(output_path)}",
+            Path(html_path).resolve().as_uri(),
+        ]
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=(os.name != "nt"),
+        )
+        deadline = time.time() + 45
+        previous_size = -1
+        stable_checks = 0
+        while time.time() < deadline:
+            if os.path.isfile(output_path):
+                current_size = os.path.getsize(output_path)
+                stable_checks = stable_checks + 1 if current_size == previous_size else 0
+                previous_size = current_size
+                if current_size > 0 and stable_checks >= 2:
+                    break
+            if process.poll() is not None:
+                break
+            time.sleep(0.25)
+        if process.poll() is None:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+        stdout, stderr = process.communicate()
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            detail = (stderr or stdout or "unknown error").strip()
+            raise RuntimeError(f"浏览器 PDF 转换失败: {detail}")
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def render_pdf(html_text, html_path, output_path):
+    try:
+        from weasyprint import HTML, default_url_fetcher
+
+        def local_only_url_fetcher(url):
+            if url.startswith("data:"):
+                return default_url_fetcher(url)
+            raise ValueError(f"Blocked external resource in report: {url}")
+
+        HTML(string=html_text, url_fetcher=local_only_url_fetcher).write_pdf(output_path)
+        return "WeasyPrint"
+    except (ImportError, OSError):
+        render_with_chromium(html_path, output_path)
+        return "Chrome/Edge"
+
+
 def main():
     parser = argparse.ArgumentParser(description="横纵分析法报告 Markdown → PDF")
     parser.add_argument("input", help="输入的 Markdown 文件路径")
     parser.add_argument("output", help="输出的 PDF 文件路径")
     parser.add_argument("--title", default=None, help="报告标题")
-    parser.add_argument("--author", default="数字生命卡兹克", help="作者名")
+    parser.add_argument("--author", default="研究报告", help="作者名")
     args = parser.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
@@ -276,11 +392,9 @@ def main():
         f.write(html)
     print(f"[OK] HTML 已生成: {html_path}")
 
-    # 转 PDF
-    from weasyprint import HTML
-    HTML(string=html).write_pdf(args.output)
+    renderer = render_pdf(html, html_path, args.output)
     size_kb = os.path.getsize(args.output) / 1024
-    print(f"[OK] PDF 已生成: {args.output} ({size_kb:.1f} KB)")
+    print(f"[OK] PDF 已生成: {args.output} ({size_kb:.1f} KB, {renderer})")
 
 
 if __name__ == "__main__":

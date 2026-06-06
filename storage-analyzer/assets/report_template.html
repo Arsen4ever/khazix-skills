@@ -149,12 +149,12 @@
     <div class="meta" id="meta"></div>
   </header>
   <div id="app"></div>
-  <footer>storage-analyzer · 只读分析 · 删除命令请自行在终端确认后执行</footer>
+  <footer>storage-analyzer · 扫描只读 · 网页默认仅提供可逆的移到废纸篓操作</footer>
 </div>
 
-<script>
+<script nonce="__CSP_NONCE__">
 const DATA = __REPORT_DATA__;
-const DELETE = __DELETE_CONFIG__; // null=静态只读报告；{token,endpoint}=server.py 提供一键删除
+const DELETE = __DELETE_CONFIG__; // null=静态只读报告；server.py 提供受控的清理操作
 const FM = (DATA.system && /win/i.test(DATA.system.os||'')) ? '资源管理器' : '访达'; // 文件管理器名，按系统
 
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -279,9 +279,11 @@ function renderGreen(items){
 function greenBatchActions(items){
   if(!DELETE) return '';
   if(!items.some(it => it.trash_paths && it.trash_paths.length)) return '';
+  const permanent = DELETE.allowPermanentDelete
+    ? `<button class="del-btn danger" data-action="batch-rm">全部永久删除</button>` : '';
   return `<span class="sec-actions">
-    <button class="del-btn trash" onclick="doBatch(this,'trash')">全部移废纸篓</button>
-    <button class="del-btn danger" onclick="doBatch(this,'rm')">全部删除</button>
+    <button class="del-btn trash" data-action="batch-trash">全部移废纸篓</button>
+    ${permanent}
     <span class="del-status sec-status"></span>
   </span>`;
 }
@@ -299,10 +301,14 @@ function doBatch(btn, mode){
     JSON.parse(decodeURIComponent(escape(atob(w.dataset.paths)))).forEach(p=>allPaths.push(p));
     const sz=w.closest('.item').querySelector('.item-size'); if(sz) gb+=parseGB(sz.textContent);
   });
-  const verb = mode==='rm' ? '直接删除（不可恢复）' : '移到废纸篓（可逆，清空后释放）';
+  const verb = mode==='rm' ? '永久删除（不可恢复）' : '移到废纸篓（可逆，清空后释放）';
   const sizeStr = gb>0 ? `，约 ${gb.toFixed(1)} GB` : '';
-  if(!confirm(`确认将这组 ${wraps.length} 项缓存全部${verb}？\n共 ${allPaths.length} 个路径${sizeStr}。`)) return;
-  postAction(secActions, allPaths, mode).then(res=>{
+  let confirmation = null;
+  if(mode === 'rm'){
+    confirmation = prompt(`永久删除不可恢复。\n请输入 DELETE 继续删除 ${allPaths.length} 个路径${sizeStr}。`);
+    if(confirmation !== 'DELETE') return;
+  } else if(!confirm(`确认将这组 ${wraps.length} 项缓存全部${verb}？\n共 ${allPaths.length} 个路径${sizeStr}。`)) return;
+  postAction(secActions, allPaths, mode, confirmation).then(res=>{
     if(res.ok){
       status.textContent = mode==='rm' ? `✓ 已删除 ${wraps.length} 项` : `✓ 已移 ${wraps.length} 项到废纸篓`;
       status.className='del-status sec-status ok';
@@ -319,28 +325,30 @@ function doBatch(btn, mode){
   });
 }
 
-// 一键删除按钮：仅当 server.py 提供了 DELETE 配置、且该项有具体 trash_paths 时渲染
+// 清理按钮：仅当 server.py 提供配置、且该项有具体 trash_paths 时渲染
 function delBlock(it){
   if(!DELETE || !it.trash_paths || !it.trash_paths.length) return '';
   const payload = btoa(unescape(encodeURIComponent(JSON.stringify(it.trash_paths))));
+  const permanent = DELETE.allowPermanentDelete
+    ? `<button class="del-btn danger" data-action="delete-rm">永久删除</button>` : '';
   return `<div class="field del-actions" data-paths="${payload}">
     <div class="label">在网页上直接处理（${it.trash_paths.length} 个路径）</div>
     <div class="del-row">
-      <button class="del-btn trash" onclick="doDelete(this,'trash')">移到废纸篓</button>
-      <button class="del-btn danger" onclick="doDelete(this,'rm')">直接删除</button>
+      <button class="del-btn trash" data-action="delete-trash">移到废纸篓</button>
+      ${permanent}
       <span class="del-status"></span>
     </div>
-    <div class="del-note"><b>移到废纸篓</b>：可逆，删错能从${FM}废纸篓捞回，但要清空废纸篓才真正释放空间。<b>直接删除</b>：立即释放、不可恢复。绿灯都是可再生缓存，删了会自动重建。</div>
+    <div class="del-note"><b>移到废纸篓</b>：默认方式，可逆，删错能从${FM}废纸篓捞回，但要清空废纸篓才真正释放空间。${DELETE.allowPermanentDelete?'<b>永久删除</b>：仅在启动服务时明确启用，且每次需要输入 DELETE。':''}</div>
   </div>`;
 }
 
-function postAction(wrap, paths, mode){
+function postAction(wrap, paths, mode, confirmation){
   const status = wrap.querySelector('.del-status');
   const btns = wrap.querySelectorAll('.del-btn');
   status.textContent = '处理中…'; status.className='del-status';
   btns.forEach(b=>b.disabled=true);
   return fetch(DELETE.endpoint, {method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({token:DELETE.token, paths, mode})})
+    body:JSON.stringify({token:DELETE.token, paths, mode, confirmation})})
     .then(r=>r.json()).then(res=>{ btns.forEach(b=>b.disabled=false); return res; })
     .catch(e=>{ btns.forEach(b=>b.disabled=false); return {ok:false, error:'连接失败：'+e}; });
 }
@@ -348,9 +356,12 @@ function postAction(wrap, paths, mode){
 function doDelete(btn, mode){
   const wrap = btn.closest('.del-actions');
   const paths = JSON.parse(decodeURIComponent(escape(atob(wrap.dataset.paths))));
-  const verb = mode==='rm' ? '直接删除（不可恢复）' : '移到废纸篓（访达可恢复）';
-  if(!confirm(`确认${verb}以下 ${paths.length} 个路径？\n\n`+paths.join('\n'))) return;
-  postAction(wrap, paths, mode).then(res=>{
+  let confirmation = null;
+  if(mode === 'rm'){
+    confirmation = prompt(`永久删除不可恢复。\n请输入 DELETE 继续处理以下 ${paths.length} 个路径：\n\n`+paths.join('\n'));
+    if(confirmation !== 'DELETE') return;
+  } else if(!confirm(`确认移到废纸篓（可恢复）以下 ${paths.length} 个路径？\n\n`+paths.join('\n'))) return;
+  postAction(wrap, paths, mode, confirmation).then(res=>{
     const status = wrap.querySelector('.del-status');
     if(res.ok){
       status.textContent = mode==='rm' ? '✓ 已删除，空间已释放' : '✓ 已移到废纸篓（访达可恢复，清空后释放空间）';
@@ -394,14 +405,14 @@ function yellowActions(it){
   if(!DELETE) return '';
   const hasTrash = it.trash_paths && it.trash_paths.length;
   const trashBtn = hasTrash
-    ? `<button class="del-btn trash" onclick="doDelete(this,'trash')">移到废纸篓（仅安全部分）</button>` : '';
+    ? `<button class="del-btn trash" data-action="delete-trash">移到废纸篓（仅安全部分）</button>` : '';
   const trashNote = hasTrash
     ? `<b>移到废纸篓（仅安全部分）</b>：只移这一项核实过可安全清理的子目录，可逆、需清空废纸篓才释放空间。` : '';
   const openNote = it.open_note ? esc(it.open_note) : '';
   return `<div class="field del-actions" data-paths="${hasTrash?b64(it.trash_paths):''}" data-open="${b64([it.path])}">
     <div class="label">在网页上处理</div>
     <div class="del-row">
-      <button class="del-btn open" onclick="doOpen(this)">在${FM}里打开</button>
+      <button class="del-btn open" data-action="open">在${FM}里打开</button>
       ${trashBtn}
       <span class="del-status"></span>
     </div>
@@ -424,7 +435,7 @@ function redActions(it){
   return `<div class="field del-actions" data-open="${b64(it.app_paths)}">
     <div class="label">在网页上处理</div>
     <div class="del-row">
-      <button class="del-btn open" onclick="doOpen(this)">在${FM}里打开（去卸载）</button>
+      <button class="del-btn open" data-action="open">在${FM}里打开（去卸载）</button>
       <span class="del-status"></span>
     </div>
     <div class="del-note"><b>在${FM}里打开</b>：定位到该应用，你可以右键「移到废纸篓」卸载，或用它自带的卸载器。应用本体放在系统目录、可能需要管理员密码，所以由你在${FM}里手动操作更稳妥，本页不代删。</div>
@@ -433,7 +444,7 @@ function redActions(it){
 
 function card(tier,name,size,path,inner){
   return `<div class="item ${tier}">
-    <div class="item-head" onclick="this.parentNode.classList.toggle('open')">
+    <div class="item-head">
       <span class="dot ${tier}"></span>
       <span class="item-name">${esc(name)}</span>
       <span class="item-badge"></span>
@@ -484,13 +495,27 @@ app.innerHTML = renderSystem(DATA.system, DATA.summary)
 
 // copy handlers (delegated)
 document.addEventListener('click', e=>{
-  const b=e.target.closest('.copy'); if(!b) return;
-  e.stopPropagation();
-  const text=decodeURIComponent(escape(atob(b.dataset.cmd)));
-  navigator.clipboard.writeText(text).then(()=>{
-    b.textContent='已复制'; b.classList.add('done');
-    setTimeout(()=>{b.textContent='复制';b.classList.remove('done');},1500);
-  });
+  const head=e.target.closest('.item-head');
+  if(head){ head.parentNode.classList.toggle('open'); return; }
+  const action=e.target.closest('[data-action]');
+  if(action){
+    const kind=action.dataset.action;
+    if(kind==='batch-rm') doBatch(action,'rm');
+    else if(kind==='batch-trash') doBatch(action,'trash');
+    else if(kind==='delete-rm') doDelete(action,'rm');
+    else if(kind==='delete-trash') doDelete(action,'trash');
+    else if(kind==='open') doOpen(action);
+    return;
+  }
+  const b=e.target.closest('.copy');
+  if(b){
+    e.stopPropagation();
+    const text=decodeURIComponent(escape(atob(b.dataset.cmd)));
+    navigator.clipboard.writeText(text).then(()=>{
+      b.textContent='已复制'; b.classList.add('done');
+      setTimeout(()=>{b.textContent='复制';b.classList.remove('done');},1500);
+    });
+  }
 });
 </script>
 </body>

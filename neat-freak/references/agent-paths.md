@@ -23,9 +23,9 @@
 | 项目级 override | `AGENTS.override.md`(若存在,覆盖同目录 AGENTS.md) |
 | Skills 目录 | `~/.codex/skills/<name>/SKILL.md` 或项目内 `.codex/skills/<name>/` |
 
-Codex 没有独立的"记忆文件 + 索引"机制,所有跨会话信息都直接写在 `AGENTS.md` 里。同步时把"项目事实"那部分内容统一放 AGENTS.md。
+Codex 的记忆与配置能力可能随运行环境变化。应优先遵守当前环境提供的记忆工具和写入规则；没有明确记忆能力时，不要把所有跨会话信息自动写入 `AGENTS.md`。
 
-发现项目里有 `TEAM_GUIDE.md` 或 `.agents.md` 也要看——这是 Codex 的 fallback 文件名。
+发现项目里有 `TEAM_GUIDE.md` 或 `.agents.md` 时，可将其作为项目文档候选检查，但不要假定它们一定是 Codex 的正式配置文件。
 
 ## OpenClaw
 

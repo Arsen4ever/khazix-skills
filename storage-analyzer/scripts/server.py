@@ -7,17 +7,22 @@ or delete them outright. Stop with Ctrl+C.
 
 Usage:
     server.py <analysis.json>
+    server.py <analysis.json> --allow-permanent-delete
 
 SAFETY MODEL — read before changing:
-- Allowlist: only paths listed in this report's green items `trash_paths` are
-  accepted. Every request path is realpath-resolved and must be in the allowlist
-  AND under $HOME. Anything else is rejected. This is the core guard — the
-  endpoint cannot be used to delete arbitrary files.
+- Allowlist: only paths listed in this report's green/yellow `trash_paths` are
+  accepted for reversible trash operations. Permanent deletion is further
+  restricted to green paths under known cache roots. Every request path is
+  realpath-resolved, checked against protected locations, and constrained to
+  the user's home directory.
 - Bound to 127.0.0.1 only; every POST requires the session token; Host header
   must be 127.0.0.1 (blocks DNS-rebinding from a malicious page).
-- Two modes: "trash" (Finder -> Trash, reversible) and "rm" (immediate,
-  irreversible). The browser confirms each action before sending.
+- "trash" is enabled by default and is reversible.
+- "rm" is disabled by default. Enabling it requires the explicit
+  --allow-permanent-delete startup flag, a safe-cache-root check, and typing
+  DELETE in the browser for every request.
 """
+import argparse
 import json
 import os
 import secrets
@@ -32,36 +37,112 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "..", "assets", "report_template.html")
 HOME = os.path.realpath(os.path.expanduser("~"))
 TOKEN = secrets.token_urlsafe(24)
+CSP_NONCE = secrets.token_urlsafe(18)
 
 DATA = {}
 TPL = ""
 RM_ALLOW = set()
 TRASH_ALLOW = set()
 OPEN_ALLOW = set()
+PERMANENT_DELETE_ENABLED = False
+
+PROTECTED_HOME_NAMES = {
+    ".agents", ".aws", ".claude", ".codex", ".config", ".gnupg", ".ssh",
+    ".Trash", "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
+}
 
 
 def expand(p):
     return os.path.realpath(os.path.expanduser(p))
 
 
-def load(src):
+def is_under(path, root, *, allow_equal=False):
+    path = expand(path)
+    root = expand(root)
+    if path == root:
+        return allow_equal
+    return path.startswith(root + os.sep)
+
+
+def is_protected(path):
+    rp = expand(path)
+    if rp == HOME:
+        return True
+    if os.path.dirname(rp) == HOME:
+        return True
+    return any(
+        rp == os.path.join(HOME, name) or rp.startswith(os.path.join(HOME, name) + os.sep)
+        for name in PROTECTED_HOME_NAMES
+    )
+
+
+def permanent_delete_roots():
+    roots = [
+        "~/Library/Caches",
+        "~/.cache",
+        "~/.npm/_cacache",
+        "~/.pnpm-store",
+        "~/.gradle/caches",
+        "~/.m2/repository",
+        "~/Library/Developer/Xcode/DerivedData",
+        "~/Library/Caches/CocoaPods",
+        "~/Library/pnpm/store",
+        "~/go/pkg/mod/cache",
+    ]
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        temp = os.environ.get("TEMP", "")
+        roots = [
+            temp,
+            os.path.join(local, "Temp") if local else "",
+            os.path.join(local, "pip", "Cache") if local else "",
+            os.path.join(local, "uv", "cache") if local else "",
+        ]
+    return [expand(root) for root in roots if root]
+
+
+def can_permanently_delete(path):
+    rp = expand(path)
+    if is_protected(rp):
+        return False
+    return any(is_under(rp, root) for root in permanent_delete_roots())
+
+
+def safe_json_for_inline_script(value):
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def load(src, allow_permanent_delete=False):
     with open(src, encoding="utf-8") as f:
         data = json.load(f)
     with open(TEMPLATE, encoding="utf-8") as f:
         tpl = f.read()
     # 三套白名单，权限从严到宽：
-    #   rm    = 仅绿灯 trash_paths（可直接删的纯缓存）
+    #   rm    = 显式启用后，仅绿灯安全缓存根目录下的 trash_paths
     #   trash = 绿灯 + 橙灯 trash_paths（橙灯只准移废纸篓，不准直接删）
     #   open  = trash 全集 + 橙灯 path + 红灯 app_paths（仅"在文件管理器打开"，非破坏性）
     rm_allow, trash_allow, open_allow = set(), set(), set()
     for it in data.get("green", []):
         for p in (it.get("trash_paths") or []):
             rp = expand(p)
-            rm_allow.add(rp); trash_allow.add(rp); open_allow.add(rp)
+            if can_permanently_delete(rp):
+                trash_allow.add(rp)
+                open_allow.add(rp)
+                if allow_permanent_delete:
+                    rm_allow.add(rp)
     for it in data.get("yellow", []):
         for p in (it.get("trash_paths") or []):
             rp = expand(p)
-            trash_allow.add(rp); open_allow.add(rp)
+            if not is_protected(rp):
+                trash_allow.add(rp)
+                open_allow.add(rp)
         if it.get("path"):
             rp = expand(it["path"])
             if os.path.exists(rp):
@@ -165,14 +246,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            f"script-src 'nonce-{CSP_NONCE}'; "
+            "style-src 'unsafe-inline'; connect-src 'self'; img-src data:; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            blob = json.dumps(DATA, ensure_ascii=False)
-            cfg = json.dumps({"token": TOKEN, "endpoint": "/action"})
-            html = TPL.replace("__REPORT_DATA__", blob).replace("__DELETE_CONFIG__", cfg)
+            blob = safe_json_for_inline_script(DATA)
+            cfg = safe_json_for_inline_script({
+                "token": TOKEN,
+                "endpoint": "/action",
+                "allowPermanentDelete": PERMANENT_DELETE_ENABLED,
+            })
+            html = (
+                TPL.replace("__REPORT_DATA__", blob)
+                .replace("__DELETE_CONFIG__", cfg)
+                .replace("__CSP_NONCE__", CSP_NONCE)
+            )
             self._send(200, html, "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
@@ -186,7 +286,18 @@ class Handler(BaseHTTPRequestHandler):
         if host not in ("127.0.0.1", "localhost"):
             self._send(403, json.dumps({"ok": False, "error": "host 不被允许"}))
             return
+        origin = self.headers.get("Origin") or ""
+        allowed_origins = {
+            f"http://127.0.0.1:{self.server.server_address[1]}",
+            f"http://localhost:{self.server.server_address[1]}",
+        }
+        if origin not in allowed_origins:
+            self._send(403, json.dumps({"ok": False, "error": "origin 不被允许"}))
+            return
         n = int(self.headers.get("Content-Length", 0))
+        if n <= 0 or n > 65536:
+            self._send(413, json.dumps({"ok": False, "error": "请求体大小不合法"}))
+            return
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
@@ -200,11 +311,24 @@ class Handler(BaseHTTPRequestHandler):
         if allow is None:
             self._send(400, json.dumps({"ok": False, "error": "未知操作"}))
             return
+        if mode == "rm":
+            if not PERMANENT_DELETE_ENABLED:
+                self._send(403, json.dumps({"ok": False, "error": "永久删除未启用"}))
+                return
+            if req.get("confirmation") != "DELETE":
+                self._send(403, json.dumps({"ok": False, "error": "永久删除确认无效"}))
+                return
         done = []
         for p in (req.get("paths") or []):
             rp = expand(p)
             if rp not in allow:
                 self._send(403, json.dumps({"ok": False, "error": "路径不在白名单：%s" % p}))
+                return
+            if is_protected(rp):
+                self._send(403, json.dumps({"ok": False, "error": "受保护路径不可操作：%s" % p}))
+                return
+            if mode == "rm" and not can_permanently_delete(rp):
+                self._send(403, json.dumps({"ok": False, "error": "路径不在安全缓存目录：%s" % p}))
                 return
             # 二级护栏：只允许用户目录或 /Applications（后者仅 open 用，删除白名单不含它）
             roots = (HOME, "/Applications")
@@ -228,16 +352,27 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-    global DATA, TPL, RM_ALLOW, TRASH_ALLOW, OPEN_ALLOW
-    DATA, TPL, RM_ALLOW, TRASH_ALLOW, OPEN_ALLOW = load(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("analysis_json")
+    parser.add_argument(
+        "--allow-permanent-delete",
+        action="store_true",
+        help="Enable irreversible deletion for allowlisted cache paths only.",
+    )
+    args = parser.parse_args()
+    global DATA, TPL, RM_ALLOW, TRASH_ALLOW, OPEN_ALLOW, PERMANENT_DELETE_ENABLED
+    PERMANENT_DELETE_ENABLED = args.allow_permanent_delete
+    DATA, TPL, RM_ALLOW, TRASH_ALLOW, OPEN_ALLOW = load(
+        args.analysis_json,
+        allow_permanent_delete=PERMANENT_DELETE_ENABLED,
+    )
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
     url = "http://127.0.0.1:%d/" % port
     print("报告服务已启动：" + url)
-    print("绿灯可删 %d 项 | 橙灯可移废纸篓/打开文件夹 %d 项 | 页面上点" % (len(RM_ALLOW), len(TRASH_ALLOW) - len(RM_ALLOW)))
+    print("可移废纸篓 %d 项 | 可永久删除 %d 项 | 页面上操作需再次确认" % (len(TRASH_ALLOW), len(RM_ALLOW)))
+    if not PERMANENT_DELETE_ENABLED:
+        print("永久删除默认关闭；本次服务只提供可逆的移到废纸篓操作。")
     print("用完按 Ctrl+C 停止服务（服务关掉后按钮即失效）")
     webbrowser.open(url)
     try:

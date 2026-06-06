@@ -28,6 +28,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "..", "assets", "report_template.html")
 
 
+def safe_json_for_inline_script(value):
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -41,9 +52,13 @@ def main():
     with open(TEMPLATE, "r", encoding="utf-8") as f:
         tpl = f.read()
 
-    blob = json.dumps(data, ensure_ascii=False)
+    blob = safe_json_for_inline_script(data)
     # 静态报告不带删除能力（DELETE=null），删除按钮只在 server.py 服务时出现
-    html = tpl.replace("__REPORT_DATA__", blob).replace("__DELETE_CONFIG__", "null")
+    html = (
+        tpl.replace("__REPORT_DATA__", blob)
+        .replace("__DELETE_CONFIG__", "null")
+        .replace("__CSP_NONCE__", "")
+    )
 
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
